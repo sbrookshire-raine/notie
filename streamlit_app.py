@@ -17,7 +17,7 @@ try:
     APP_SECRET = st.secrets["dropbox"]["app_secret"]
     REFRESH_TOKEN = st.secrets["dropbox"]["refresh_token"]
 except Exception as e:
-    st.error("❌ Secrets missing on Streamlit Cloud.")
+    st.error("❌ Secrets missing. Check Settings > Secrets on Streamlit Cloud.")
     st.stop()
 
 # 2. Connect to Dropbox
@@ -66,25 +66,23 @@ def extract_items_from_summary(summary_text):
     return items
 
 def sync_new_files():
-    """Scans Dropbox and generates a detailed log."""
+    """Scans Dropbox with CATCH-ALL logic."""
     current_db = st.session_state.db_cache
     new_count = 0
-    logs = [] # The detailed report
+    logs = []
     
     try:
         result = dbx.files_list_folder("")
         
         for entry in result.entries:
-            # 1. IGNORE SYSTEM FILES
             if not entry.name.endswith(".json") or "db" in entry.name:
                 continue
 
-            # 2. CHECK IF PROCESSED
+            # Check if processed
             if entry.name in current_db['processed_files']:
-                logs.append(f"⏭️ **{entry.name}**: Skipped (Filename already in database)")
+                logs.append(f"⏭️ **{entry.name}**: Skipped (Already processed)")
                 continue
 
-            # 3. PROCESS NEW FILE
             logs.append(f"📥 **{entry.name}**: Reading...")
             md, res = dbx.files_download(entry.path_lower)
             try:
@@ -99,55 +97,61 @@ def sync_new_files():
             file_new_tasks = 0
             for note in notes:
                 notie_id = note.get('id')
-                note_name = note.get('name', 'Untitled')
                 
-                # CHECK ID DUPLICATION
                 if notie_id in current_db.get('imported_ids', []):
-                    # We skipped this specific note
                     continue
 
-                # EXTRACT CONTENT
                 title = note.get('name', 'Untitled Project')
                 summary = note.get('summary', '')
                 created_at = note.get('createdAt', str(datetime.now()))
                 
                 topic_match = re.search(r'\[MAIN_TOPIC\](.*?)(?=\[|$)', summary, re.DOTALL | re.IGNORECASE)
                 main_topic = topic_match.group(1).strip() if topic_match else ""
+                
+                # 1. Try to get items from Summary
                 checklist_items = extract_items_from_summary(summary)
                 
-                # FALLBACK EXTRACTION
+                # 2. Try to get items from Keywords
                 if not checklist_items:
                     content = note.get('beautifiedContent', note.get('rawTranscription', ''))
                     sentences = content.replace('\n', '. ').split('. ')
-                    keywords = ["need", "must", "should", "todo", "plan"]
+                    keywords = ["need", "must", "should", "todo", "plan", "reminder"]
                     for s in sentences:
                         if any(k in s.lower() for k in keywords):
                             checklist_items.append(s.strip())
 
-                if checklist_items:
-                    project_id = generate_id(title + created_at)
-                    checklist_data = [{"text": item, "done": False} for item in checklist_items]
-                    
-                    current_db['projects'].append({
-                        "id": project_id,
-                        "notie_id": notie_id,
-                        "title": title,
-                        "topic": main_topic,
-                        "created_at": created_at,
-                        "checklist": checklist_data,
-                        "archived": False,
-                        "user_notes": ""
-                    })
-                    
-                    if 'imported_ids' not in current_db: current_db['imported_ids'] = []
-                    current_db['imported_ids'].append(notie_id)
-                    new_count += 1
-                    file_new_tasks += 1
+                # 3. CATCH-ALL FALLBACK (The Fix)
+                # If still empty, force a generic task so the note isn't lost.
+                if not checklist_items:
+                    checklist_items.append("Review Note Content (No specific actions detected)")
+
+                # Create Project
+                project_id = generate_id(title + created_at)
+                checklist_data = [{"text": item, "done": False} for item in checklist_items]
+                
+                # Store the full content in 'user_notes' initially for context
+                full_content = note.get('beautifiedContent', note.get('rawTranscription', ''))
+                
+                current_db['projects'].append({
+                    "id": project_id,
+                    "notie_id": notie_id,
+                    "title": title,
+                    "topic": main_topic,
+                    "created_at": created_at,
+                    "checklist": checklist_data,
+                    "archived": False,
+                    "user_notes": full_content # Pre-fill notes with the full text!
+                })
+                
+                if 'imported_ids' not in current_db: current_db['imported_ids'] = []
+                current_db['imported_ids'].append(notie_id)
+                new_count += 1
+                file_new_tasks += 1
             
             if file_new_tasks > 0:
-                logs.append(f"✅ **{entry.name}**: Success! Imported {file_new_tasks} new projects.")
+                logs.append(f"✅ **{entry.name}**: Success! Added {file_new_tasks} projects.")
             else:
-                logs.append(f"⚠️ **{entry.name}**: File read, but all Note IDs inside were duplicates.")
+                logs.append(f"⚠️ **{entry.name}**: Read file, but found no *new* Note IDs.")
 
             current_db['processed_files'].append(entry.name)
         
@@ -199,26 +203,31 @@ if st.session_state.db_cache is None:
 with st.sidebar:
     st.header("Controls")
     
-    # SYNC BUTTON with LOGS
     if st.button("🔄 Check for New Notes", type="primary"):
-        with st.spinner("Scanning Dropbox..."):
+        with st.spinner("Scanning..."):
             count, logs = sync_new_files()
-            
             if count > 0:
-                st.success(f"Imported {count} new projects!")
+                st.success(f"Imported {count} projects!")
             elif len(logs) > 0:
                 st.info("Scan complete. See logs below.")
-            else:
-                st.warning("No files found.")
             
             st.divider()
-            st.subheader("📜 Sync Logs")
-            for log in logs:
-                st.markdown(log)
+            with st.expander("View Logs", expanded=True):
+                for log in logs:
+                    st.markdown(log)
                     
     st.divider()
     view_mode = st.radio("View:", ["Active Projects", "Archived"])
     hide_completed = st.toggle("Hide completed items")
+    
+    st.divider()
+    if st.button("⚠️ Reset Database (Delete All)"):
+        try:
+            dbx.files_delete(DATA_FILENAME)
+            st.session_state.db_cache = None
+            st.rerun()
+        except:
+            st.error("Database already empty.")
 
 # --- RENDER ---
 db = st.session_state.db_cache
@@ -231,7 +240,6 @@ if not visible_projects:
 for project in visible_projects:
     total = len(project['checklist'])
     done = len([x for x in project['checklist'] if x['done']])
-    
     icon = "✅" if (total > 0 and total == done) else "📌"
     
     with st.expander(f"{icon} {project['title']} ({done}/{total})", expanded=not is_archived):
@@ -249,8 +257,9 @@ for project in visible_projects:
         st.divider()
         c1, c2 = st.columns([3, 1])
         with c1:
-            st.text_area("Notes", project['user_notes'], height=70, key=f"n_{project['id']}", on_change=update_note, args=(project['id'],))
+            st.caption("Project Notes / Full Content:")
+            st.text_area("Notes", project['user_notes'], height=100, key=f"n_{project['id']}", on_change=update_note, args=(project['id'],))
         with c2:
-            st.write(""); st.write("")
+            st.write(""); st.write(""); st.write("")
             lbl = "Unarchive" if is_archived else "Archive"
             st.button(lbl, key=f"a_{project['id']}", on_click=archive_proj, args=(project['id'], not is_archived))
