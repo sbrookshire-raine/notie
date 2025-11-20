@@ -1,0 +1,2 @@
+# Ignore all JSON files so the app doesn't restart when we save data
+*.json
